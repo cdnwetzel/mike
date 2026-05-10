@@ -7,51 +7,91 @@ import type {
     StreamChatResult,
 } from "./types";
 
-const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
+const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 const MAX_OUTPUT_TOKENS = 16384;
 
-type ResponseInputItem =
-    | { role: "user" | "assistant"; content: string }
-    | { type: "function_call_output"; call_id: string; output: string };
-
-type ResponseFunctionTool = {
-    type: "function";
+type ChatCompletionFunction = {
     name: string;
-    description?: string;
-    parameters: Record<string, unknown>;
+    arguments: string;
 };
 
-type ResponseFunctionCallItem = {
-    type: "function_call";
-    call_id?: string;
-    name?: string;
-    arguments?: string;
+type ChatCompletionToolCall = {
+    id: string;
+    type: "function";
+    function: ChatCompletionFunction;
 };
 
-type ResponseStreamEvent = {
-    type?: string;
-    delta?: string;
-    response?: { id?: string; output_text?: string };
-    item?: ResponseFunctionCallItem;
+type ChatCompletionMessage =
+    | {
+          role: "system" | "user" | "assistant";
+          content: string;
+          tool_calls?: ChatCompletionToolCall[];
+      }
+    | { role: "tool"; tool_call_id: string; content: string };
+
+type ChatCompletionTool = {
+    type: "function";
+    function: {
+        name: string;
+        description?: string;
+        parameters: Record<string, unknown>;
+    };
+};
+
+type ChatCompletionChunk = {
+    choices?: {
+        delta?: {
+            content?: string;
+            tool_calls?: {
+                index: number;
+                id?: string;
+                function?: {
+                    name?: string;
+                    arguments?: string;
+                };
+            }[];
+        };
+    }[];
 };
 
 function apiKey(override?: string | null): string {
     return override?.trim() || process.env.OPENAI_API_KEY?.trim() || "";
 }
 
-function toResponseTools(tools: OpenAIToolSchema[]): ResponseFunctionTool[] {
-    return tools.map((tool) => ({
-        type: "function",
-        name: tool.function.name,
-        description: tool.function.description,
-        parameters: tool.function.parameters,
-    }));
+function openAIBaseUrl(): string {
+    const configured =
+        process.env.OPENAI_BASE_URL?.trim() ||
+        process.env.OPENAI_API_BASE_URL?.trim();
+    return (configured || DEFAULT_OPENAI_BASE_URL).replace(/\/+$/, "");
 }
 
-function toResponseInput(messages: LlmMessage[]): ResponseInputItem[] {
+function chatCompletionsUrl(): string {
+    return `${openAIBaseUrl()}/chat/completions`;
+}
+
+function selectedModel(model: string): string {
+    return (
+        process.env.OPENAI_MODEL_OVERRIDE?.trim() ||
+        process.env.OPENAI_MODEL?.trim() ||
+        model
+    );
+}
+
+function toChatCompletionMessages(messages: LlmMessage[]): ChatCompletionMessage[] {
     return messages.map((message) => ({
         role: message.role,
         content: message.content,
+    }));
+}
+
+function toChatCompletionTools(tools: OpenAIToolSchema[]): ChatCompletionTool[] {
+    return tools.map((tool) => ({
+        type: "function",
+        function: {
+            name: tool.function.name,
+            description: tool.function.description,
+            parameters: tool.function.parameters,
+        },
     }));
 }
 
@@ -80,52 +120,48 @@ function extractSseJson(buffer: string): { events: unknown[]; rest: string } {
     return { events, rest };
 }
 
-function parseFunctionCall(item: ResponseFunctionCallItem): NormalizedToolCall {
-    let input: Record<string, unknown> = {};
+function parseFunctionCall(rawCall: {
+    id?: string;
+    name?: string;
+    arguments?: string;
+}): NormalizedToolCall {
+    let parsedInput: Record<string, unknown> = {};
     try {
-        const parsed = JSON.parse(item.arguments || "{}");
+        const parsed = JSON.parse(rawCall.arguments || "{}");
         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-            input = parsed as Record<string, unknown>;
+            parsedInput = parsed as Record<string, unknown>;
         }
     } catch {
-        input = {};
+        parsedInput = {};
     }
 
     return {
-        id: item.call_id ?? item.name ?? "function_call",
-        name: item.name ?? "",
-        input,
+        id: rawCall.id ?? rawCall.name ?? "function_call",
+        name: rawCall.name ?? "",
+        input: parsedInput,
     };
 }
 
-async function createResponse(params: {
+async function createChatCompletion(params: {
     model: string;
-    input: ResponseInputItem[];
-    instructions?: string;
-    tools?: ResponseFunctionTool[];
+    messages: ChatCompletionMessage[];
+    tools?: ChatCompletionTool[];
     stream?: boolean;
     maxTokens?: number;
-    previousResponseId?: string;
-    reasoningSummary?: boolean;
     apiKey: string;
 }): Promise<Response> {
-    const response = await fetch(OPENAI_RESPONSES_URL, {
+    const response = await fetch(chatCompletionsUrl(), {
         method: "POST",
         headers: {
             Authorization: `Bearer ${params.apiKey}`,
             "Content-Type": "application/json",
         },
         body: JSON.stringify({
-            model: params.model,
-            instructions: params.instructions || undefined,
-            input: params.input,
+            model: selectedModel(params.model),
+            messages: params.messages,
             tools: params.tools?.length ? params.tools : undefined,
             stream: params.stream,
-            max_output_tokens: params.maxTokens ?? MAX_OUTPUT_TOKENS,
-            previous_response_id: params.previousResponseId,
-            reasoning: params.reasoningSummary
-                ? { summary: "auto" }
-                : undefined,
+            max_tokens: params.maxTokens ?? MAX_OUTPUT_TOKENS,
         }),
     });
 
@@ -153,32 +189,33 @@ export async function streamOpenAI(
     } = params;
     const maxIter = params.maxIterations ?? 10;
     const key = apiKey(apiKeys?.openai);
-    const responseTools = toResponseTools(tools);
-    let input = toResponseInput(params.messages);
-    let previousResponseId: string | undefined;
+    const responseTools = toChatCompletionTools(tools);
+    const messages = toChatCompletionMessages(params.messages);
     let fullText = "";
     const hasTools = responseTools.length > 0;
 
     for (let iter = 0; iter < maxIter; iter++) {
-        const response = await createResponse({
+        const response = await createChatCompletion({
             model,
-            instructions: iter === 0 ? systemPrompt : undefined,
-            input,
+            messages:
+                iter === 0
+                    ? [{ role: "system", content: systemPrompt }, ...messages]
+                    : messages,
             tools: responseTools,
             stream: true,
-            previousResponseId,
-            reasoningSummary: !!enableThinking,
             apiKey: key,
         });
         if (!response.body) throw new Error("OpenAI response had no body");
 
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
-        const toolCalls: NormalizedToolCall[] = [];
+        const rawToolCalls = new Map<
+            number,
+            { id?: string; name?: string; arguments: string }
+        >();
         const startedToolCallIds = new Set<string>();
         let buffer = "";
         let pendingText = "";
-        let sawReasoning = false;
 
         while (true) {
             const { done, value } = await reader.read();
@@ -188,54 +225,58 @@ export async function streamOpenAI(
             const extracted = extractSseJson(buffer);
             buffer = extracted.rest;
 
-            for (const event of extracted.events as ResponseStreamEvent[]) {
-                if (event.response?.id) {
-                    previousResponseId = event.response.id;
-                }
+            for (const event of extracted.events as ChatCompletionChunk[]) {
+                const delta = event.choices?.[0]?.delta;
+                if (!delta) continue;
 
-                if (
-                    event.type === "response.reasoning_summary_text.delta" &&
-                    typeof event.delta === "string"
-                ) {
-                    sawReasoning = true;
-                    callbacks.onReasoningDelta?.(event.delta);
-                }
-
-                if (
-                    event.type === "response.output_text.delta" &&
-                    typeof event.delta === "string"
-                ) {
+                if (typeof delta.content === "string") {
                     if (hasTools) {
-                        pendingText += event.delta;
+                        pendingText += delta.content;
                     } else {
-                        fullText += event.delta;
-                        callbacks.onContentDelta?.(event.delta);
+                        fullText += delta.content;
+                        callbacks.onContentDelta?.(delta.content);
                     }
                 }
 
-                if (
-                    event.type === "response.output_item.added" &&
-                    event.item?.type === "function_call"
-                ) {
-                    const call = parseFunctionCall(event.item);
-                    startedToolCallIds.add(call.id);
-                    callbacks.onToolCallStart?.(call);
-                }
+                for (const partialCall of delta.tool_calls ?? []) {
+                    const existing = rawToolCalls.get(partialCall.index) ?? {
+                        arguments: "",
+                    };
+                    if (partialCall.id) existing.id = partialCall.id;
+                    if (partialCall.function?.name) {
+                        existing.name = partialCall.function.name;
+                    }
+                    if (typeof partialCall.function?.arguments === "string") {
+                        existing.arguments += partialCall.function.arguments;
+                    }
+                    rawToolCalls.set(partialCall.index, existing);
 
-                if (
-                    event.type === "response.output_item.done" &&
-                    event.item?.type === "function_call"
-                ) {
-                    const call = parseFunctionCall(event.item);
-                    if (!startedToolCallIds.has(call.id)) {
+                    const provisionalId =
+                        existing.id ??
+                        existing.name ??
+                        `tool_call_${partialCall.index}`;
+                    if (!startedToolCallIds.has(provisionalId)) {
+                        startedToolCallIds.add(provisionalId);
+                        const call = parseFunctionCall({
+                            id: provisionalId,
+                            name: existing.name,
+                            arguments: existing.arguments,
+                        });
                         callbacks.onToolCallStart?.(call);
                     }
-                    toolCalls.push(call);
                 }
             }
         }
 
-        if (sawReasoning) callbacks.onReasoningBlockEnd?.();
+        const orderedRawCalls = [...rawToolCalls.entries()]
+            .sort(([a], [b]) => a - b)
+            .map(([, value], i) => ({
+                id: value.id ?? value.name ?? `tool_call_${i}`,
+                name: value.name ?? "",
+                arguments: value.arguments,
+            }));
+
+        const toolCalls = orderedRawCalls.map((call) => parseFunctionCall(call));
 
         if (!toolCalls.length || !runTools) {
             if (pendingText) {
@@ -245,12 +286,30 @@ export async function streamOpenAI(
             break;
         }
 
+        const assistantToolCalls: ChatCompletionToolCall[] = orderedRawCalls.map(
+            (call) => ({
+                id: call.id,
+                type: "function",
+                function: {
+                    name: call.name,
+                    arguments: call.arguments || "{}",
+                },
+            }),
+        );
+        messages.push({
+            role: "assistant",
+            content: pendingText,
+            tool_calls: assistantToolCalls,
+        });
+
         const results = await runTools(toolCalls);
-        input = results.map((result) => ({
-            type: "function_call_output",
-            call_id: result.tool_use_id,
-            output: result.content,
-        }));
+        for (const result of results) {
+            messages.push({
+                role: "tool",
+                tool_call_id: result.tool_use_id,
+                content: result.content,
+            });
+        }
     }
 
     return { fullText };
@@ -263,29 +322,34 @@ export async function completeOpenAIText(params: {
     maxTokens?: number;
     apiKeys?: { openai?: string | null };
 }): Promise<string> {
-    const response = await createResponse({
+    const response = await createChatCompletion({
         model: params.model,
-        instructions: params.systemPrompt,
-        input: [{ role: "user", content: params.user }],
+        messages: [
+            ...(params.systemPrompt
+                ? ([{ role: "system", content: params.systemPrompt }] as const)
+                : []),
+            { role: "user", content: params.user },
+        ],
         maxTokens: params.maxTokens ?? 512,
         apiKey: apiKey(params.apiKeys?.openai),
     });
     const json = (await response.json()) as {
-        output_text?: string;
-        output?: {
-            content?: { type?: string; text?: string }[];
+        choices?: {
+            message?: {
+                content?: string | { type?: string; text?: string }[];
+            };
         }[];
     };
 
-    if (typeof json.output_text === "string") return json.output_text;
-
-    return (
-        json.output
-            ?.flatMap((item) => item.content ?? [])
-            .filter((content) => content.type === "output_text")
-            .map((content) => content.text ?? "")
-            .join("") ?? ""
-    );
+    const content = json.choices?.[0]?.message?.content;
+    if (typeof content === "string") return content;
+    if (Array.isArray(content)) {
+        return content
+            .filter((part) => part?.type === "text")
+            .map((part) => part.text ?? "")
+            .join("");
+    }
+    return "";
 }
 
 export type { NormalizedToolResult };

@@ -36,7 +36,9 @@ SUPABASE_SECRET_KEY=your-supabase-service-role-key
 ```
 
 Model-provider keys such as `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, and
-`OPENROUTER_API_KEY` should also stay in `backend/.env`.
+`OPENAI_API_KEY` should also stay in `backend/.env`. For OpenAI-compatible
+servers (Open WebUI, vLLM, Ollama adapters), set `OPENAI_BASE_URL` in
+`backend/.env` to that server's `/v1` base URL.
 
 ## Test With Synthetic Documents
 
