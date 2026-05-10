@@ -59,9 +59,7 @@ function apiKey(override?: string | null): string {
 }
 
 function openAIBaseUrl(): string {
-    const configured =
-        process.env.OPENAI_BASE_URL?.trim() ||
-        process.env.OPENAI_API_BASE_URL?.trim();
+    const configured = process.env.OPENAI_BASE_URL?.trim();
     return (configured || DEFAULT_OPENAI_BASE_URL).replace(/\/+$/, "");
 }
 
@@ -140,6 +138,10 @@ function parseFunctionCall(rawCall: {
         name: rawCall.name ?? "",
         input: parsedInput,
     };
+}
+
+function toolCallId(id: string | undefined, name: string | undefined, index: number): string {
+    return id ?? name ?? `tool_call_${index}`;
 }
 
 async function createChatCompletion(params: {
@@ -251,10 +253,11 @@ export async function streamOpenAI(
                     }
                     rawToolCalls.set(partialCall.index, existing);
 
-                    const provisionalId =
-                        existing.id ??
-                        existing.name ??
-                        `tool_call_${partialCall.index}`;
+                    const provisionalId = toolCallId(
+                        existing.id,
+                        existing.name,
+                        partialCall.index,
+                    );
                     if (!startedToolCallIds.has(provisionalId)) {
                         startedToolCallIds.add(provisionalId);
                         const call = parseFunctionCall({
@@ -270,13 +273,19 @@ export async function streamOpenAI(
 
         const orderedRawCalls = [...rawToolCalls.entries()]
             .sort(([a], [b]) => a - b)
-            .map(([, value], i) => ({
-                id: value.id ?? value.name ?? `tool_call_${i}`,
+            .map(([index, value]) => ({
+                id: toolCallId(value.id, value.name, index),
                 name: value.name ?? "",
-                arguments: value.arguments,
+                argumentsText: value.arguments,
             }));
 
-        const toolCalls = orderedRawCalls.map((call) => parseFunctionCall(call));
+        const toolCalls = orderedRawCalls.map((call) =>
+            parseFunctionCall({
+                id: call.id,
+                name: call.name,
+                arguments: call.argumentsText,
+            }),
+        );
 
         if (!toolCalls.length || !runTools) {
             if (pendingText) {
@@ -292,7 +301,7 @@ export async function streamOpenAI(
                 type: "function",
                 function: {
                     name: call.name,
-                    arguments: call.arguments || "{}",
+                    arguments: call.argumentsText || "{}",
                 },
             }),
         );
@@ -322,14 +331,16 @@ export async function completeOpenAIText(params: {
     maxTokens?: number;
     apiKeys?: { openai?: string | null };
 }): Promise<string> {
+    const systemMessages: ChatCompletionMessage[] = params.systemPrompt
+        ? [{ role: "system", content: params.systemPrompt }]
+        : [];
+    const messages: ChatCompletionMessage[] = [
+        ...systemMessages,
+        { role: "user", content: params.user },
+    ];
     const response = await createChatCompletion({
         model: params.model,
-        messages: [
-            ...(params.systemPrompt
-                ? ([{ role: "system", content: params.systemPrompt }] as const)
-                : []),
-            { role: "user", content: params.user },
-        ],
+        messages,
         maxTokens: params.maxTokens ?? 512,
         apiKey: apiKey(params.apiKeys?.openai),
     });
