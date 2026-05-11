@@ -16,12 +16,10 @@ export default function GlobalError({
             <head>
                 <title>Something went wrong – Mike</title>
                 <style>{`
-                    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=EB+Garamond:wght@400;500&display=swap');
-                    
                     * { margin: 0; padding: 0; box-sizing: border-box; }
                     
                     body {
-                        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+                        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif;
                         background-color: #ffffff;
                         color: #111;
                         min-height: 100vh;
@@ -37,7 +35,7 @@ export default function GlobalError({
                     }
 
                     .error-title {
-                        font-family: 'EB Garamond', Georgia, serif;
+                        font-family: Georgia, 'Times New Roman', Times, serif;
                         font-size: 1.75rem;
                         font-weight: 400;
                         color: #111;
@@ -59,7 +57,7 @@ export default function GlobalError({
                         border-radius: 0.5rem;
                         font-size: 0.875rem;
                         font-weight: 500;
-                        font-family: 'Inter', sans-serif;
+                        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif;
                         cursor: pointer;
                         transition: all 0.15s ease;
                         text-decoration: none;
